@@ -1,0 +1,11 @@
+[package]
+name = "bwinner"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+async-channel = "2.3.1"
+async-std = "1.12.0"
+clap = { version = "4.5.16", features = ["derive"] }
+lettre = { git = "https://github.com/lettre/lettre.git", default-features = false, features = ["builder", "hostname", "smtp-transport", "async-std1", "async-std1-rustls-tls"] }
+tokio = { version = "1.39.3", features = ["full"] }
