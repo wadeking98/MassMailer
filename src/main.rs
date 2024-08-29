@@ -1,13 +1,23 @@
-use async_std::io::{self, WriteExt};
+use std::io::{self, Write};
 
 use clap::Parser;
+use crossbeam::channel::bounded;
 use lettre::message::header::{self, ContentType, To};
 use lettre::message::Mailboxes;
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::transport::smtp::response::Response;
-use lettre::transport::smtp::Error;
-use lettre::{AsyncSmtpTransport, AsyncStd1Executor, AsyncTransport, Message};
-use async_channel::bounded;
+use lettre::{Message, SmtpTransport, Transport};
+use std::thread;
+
+#[macro_use]
+extern crate error_chain;
+
+mod errors {
+    // Create the Error, ErrorKind, ResultExt, and Result types
+    error_chain! {}
+}
+
+use errors::*;
 
 /// Parse smtp config from command line
 #[derive(Parser, Debug)]
@@ -49,6 +59,10 @@ struct Args {
     #[arg(long, default_value = "2")]
     batch_size: u32,
 
+    /// Per Email delay
+    #[arg(long, default_value = "0.0")]
+    delay: f32,
+
     /// Threads
     #[arg(short, long, default_value = "10")]
     threads: u32,
@@ -58,13 +72,13 @@ struct Args {
     exfil: String,
 }
 
-async fn send_email(
+fn send_email(
     recipients: To,
     from: String,
     subject: String,
     body: String,
-    mailer: AsyncSmtpTransport<AsyncStd1Executor>,
-) -> Result<Response, Error> {
+    mailer: &SmtpTransport,
+) -> Result<Response> {
     let email = Message::builder()
         .from(from.parse().unwrap())
         .reply_to(from.parse().unwrap())
@@ -72,24 +86,20 @@ async fn send_email(
         .subject(subject)
         .header(ContentType::TEXT_HTML)
         .body(body)
-        .unwrap();
+        .chain_err(|| "Could not build email")?;
 
     // Send the email
-    mailer.send(email).await
+    mailer.send(&email).chain_err(|| "Could not send email")
 }
 
-enum ProcessMessage {
-    Email {
-        recipients: To,
-        from: String,
-        subject: String,
-        body: String,
-    },
-    Done,
+struct EmailMessage {
+    recipients: To,
+    from: String,
+    subject: String,
+    body: String,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Error> {
+fn main() -> Result<()> {
     let mut args = Args::parse();
     if args.from.is_none() {
         args.from = Some(args.username.clone());
@@ -104,11 +114,10 @@ async fn main() -> Result<(), Error> {
 
     let creds = Credentials::new(args.username, args.password);
 
-    let mailer: AsyncSmtpTransport<AsyncStd1Executor> =
-        AsyncSmtpTransport::<AsyncStd1Executor>::starttls_relay(&args.server)
-            .unwrap()
-            .credentials(creds)
-            .build();
+    let mailer = SmtpTransport::starttls_relay(&args.server)
+        .unwrap()
+        .credentials(creds)
+        .build();
 
     let mut batch_recipients = String::new();
     let mut ilast = 0;
@@ -118,26 +127,23 @@ async fn main() -> Result<(), Error> {
         range = (args.fuzz_end..=args.fuzz_start).rev().collect();
         direction = -1;
     }
-    let (send, recv) = bounded::<ProcessMessage>(args.threads as usize);
+    let (send, recv) = bounded::<EmailMessage>(args.threads as usize);
     let mut receivers = Vec::new();
     // start receiver threads
     for _ in 0..args.threads {
         let recv = recv.clone();
         let mailer = mailer.clone();
-        let handle = tokio::spawn(async move {
-            loop {
-                match recv.recv().await {
-                    Ok(ProcessMessage::Email {
-                        recipients,
-                        from,
-                        subject,
-                        body,
-                    }) => {
-                        send_email(recipients, from, subject, body, mailer.clone()).await.ok();
-                    }
-                    Ok(ProcessMessage::Done) => break,
-                    Err(_) => break,
+        let handle = thread::spawn(move || loop {
+            match recv.recv() {
+                Ok(EmailMessage {
+                    recipients,
+                    from,
+                    subject,
+                    body,
+                }) => {
+                    send_email(recipients, from, subject, body, &mailer).ok();
                 }
+                Err(_) => break,
             }
         });
         receivers.push(handle);
@@ -160,13 +166,17 @@ async fn main() -> Result<(), Error> {
                     _ => 0,
                 }
             );
-            io::stdout().flush().await.unwrap();
-            send.send(ProcessMessage::Email {
+            io::stdout().flush().unwrap();
+            if args.delay > 0.0 {
+                thread::sleep(std::time::Duration::from_millis((args.delay * 1000.0) as u64));
+            }
+            send.send(EmailMessage {
                 recipients: to_header,
                 from: args.from.as_ref().unwrap().to_owned(),
                 subject: args.subject.clone(),
                 body,
-            }).await.unwrap();
+            })
+            .chain_err(|| "Could not send email over channel")?;
             batch_recipients = String::new();
         }
         ilast = i;
@@ -178,35 +188,31 @@ async fn main() -> Result<(), Error> {
 
         let mailboxes: Mailboxes = batch_recipients.parse().unwrap();
         let to_header: header::To = mailboxes.into();
-        let body = args.exfil.replace(
-            "FUZZ",
-            format!(
-                "{}",
-                ilast.to_string()
-            )
-            .as_str(),
+        let body = args
+            .exfil
+            .replace("FUZZ", format!("{}", ilast.to_string()).as_str());
+        print!(
+            "\rSending email: [{}/{}]\n",
+            ilast,
+            match direction {
+                1 => args.fuzz_end,
+                -1 => args.fuzz_start,
+                _ => 0,
+            }
         );
-        print!("\rSending email: [{}/{}]\n", ilast, match direction {
-            1 => args.fuzz_end,
-            -1 => args.fuzz_start,
-            _ => 0,
-        });
-        send_email(
-            to_header,
-            args.from.as_ref().unwrap().to_owned(),
-            args.subject.clone(),
+        send.send(EmailMessage {
+            recipients: to_header,
+            from: args.from.as_ref().unwrap().to_owned(),
+            subject: args.subject.clone(),
             body,
-            mailer.clone(),
-        )
-        .await?;
+        })
+        .chain_err(|| "Could not send email over channel")?;
     }
 
     // close all the threads
-    for _ in 0..args.threads {
-        send.send(ProcessMessage::Done).await.unwrap();
-    }
+    drop(send);
     for handle in receivers {
-        handle.await.ok();
+        handle.join().unwrap();
     }
 
     Ok(())
